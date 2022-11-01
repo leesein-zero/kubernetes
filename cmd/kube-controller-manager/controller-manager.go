@@ -32,6 +32,7 @@ import (
 )
 
 func main() {
+	// ControllerManager 的启动入口
 	command := app.NewControllerManagerCommand()
 	code := cli.Run(command)
 	os.Exit(code)

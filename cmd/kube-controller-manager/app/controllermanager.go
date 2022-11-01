@@ -100,6 +100,7 @@ const (
 )
 
 // NewControllerManagerCommand creates a *cobra.Command object with default parameters
+// 发现k8s 比较喜欢用cobra 这个库，来做命令行工具，以后可以学习下
 func NewControllerManagerCommand() *cobra.Command {
 	s, err := options.NewKubeControllerManagerOptions()
 	if err != nil {
@@ -123,6 +124,7 @@ controller, and serviceaccounts controller.`,
 			restclient.SetDefaultWarningHandler(restclient.NoWarnings{})
 			return nil
 		},
+		// cobra 的Run部分
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verflag.PrintAndExitIfRequested()
 
@@ -222,16 +224,28 @@ func Run(c *config.CompletedConfig, stopCh <-chan struct{}) error {
 
 	saTokenControllerInitFunc := serviceAccountTokenControllerStarter{rootClientBuilder: rootClientBuilder}.startServiceAccountTokenController
 
+	// 这里和下面才是重头戏
+	// 和之前看的lease机制串起来了，controller-manager的原理就是，定义一个run方法，然后起多个协程去竞争lease锁
+	// 取到锁的执行，没取到的阻塞
+	// 注意第三个参数 initializersFunc，这个就是所有预先准备好的informer集合
 	run := func(ctx context.Context, startSATokenController InitFunc, initializersFunc ControllerInitializersFunc) {
+
+		// 第一步，先创建控制器的上下文
+		// 里面就包含了 informer的创建
 		controllerContext, err := CreateControllerContext(c, rootClientBuilder, clientBuilder, ctx.Done())
 		if err != nil {
 			klog.Fatalf("error building controller context: %v", err)
 		}
+
+		// 第二步，执行传进来的initializersFunc ，这里面是一个map，全部都是初始化方法
 		controllerInitializers := initializersFunc(controllerContext.LoopMode)
+
+		// 上面的所有controller，都作为参数，传给了 StartControllers
 		if err := StartControllers(ctx, controllerContext, startSATokenController, controllerInitializers, unsecuredMux, healthzHandler); err != nil {
 			klog.Fatalf("error starting controllers: %v", err)
 		}
 
+		// 本质上，调用了所有informer的run方法
 		controllerContext.InformerFactory.Start(stopCh)
 		controllerContext.ObjectOrMetadataInformerFactory.Start(stopCh)
 		close(controllerContext.InformersStarted)
@@ -276,6 +290,7 @@ func Run(c *config.CompletedConfig, stopCh <-chan struct{}) error {
 	}
 
 	// Start the main lock
+	// 这一步就挺明显了，获取锁，拿到的跑controller manager的真正run方法
 	go leaderElectAndRun(c, id, electionChecker,
 		c.ComponentConfig.Generic.LeaderElection.ResourceLock,
 		c.ComponentConfig.Generic.LeaderElection.ResourceName,
@@ -285,6 +300,8 @@ func Run(c *config.CompletedConfig, stopCh <-chan struct{}) error {
 				if leaderMigrator != nil {
 					// If leader migration is enabled, we should start only non-migrated controllers
 					//  for the main lock.
+
+					// 这里面，就是所有controller的准备阶段
 					initializersFunc = createInitializersFunc(leaderMigrator.FilterFunc, leadermigration.ControllerNonMigrated)
 					klog.Info("leader migration: starting main controllers.")
 				}
@@ -504,6 +521,8 @@ func GetAvailableResources(clientBuilder clientbuilder.ControllerClientBuilder) 
 // the shared-informers client and token controller.
 func CreateControllerContext(s *config.CompletedConfig, rootClientBuilder, clientBuilder clientbuilder.ControllerClientBuilder, stop <-chan struct{}) (ControllerContext, error) {
 	versionedClient := rootClientBuilder.ClientOrDie("shared-informers")
+
+	// 创建了共享的informerFactory
 	sharedInformers := informers.NewSharedInformerFactory(versionedClient, ResyncPeriod(s)())
 
 	metadataClient := metadata.NewForConfigOrDie(rootClientBuilder.ConfigOrDie("metadata-informers"))
@@ -552,6 +571,7 @@ func CreateControllerContext(s *config.CompletedConfig, rootClientBuilder, clien
 }
 
 // StartControllers starts a set of controllers with a specified ControllerContext
+// 真正去注册所有的informer
 func StartControllers(ctx context.Context, controllerCtx ControllerContext, startSATokenController InitFunc, controllers map[string]InitFunc,
 	unsecuredMux *mux.PathRecorderMux, healthzHandler *controllerhealthz.MutableHealthzHandler) error {
 	// Always start the SA token controller first using a full-power client, since it needs to mint tokens for the rest
@@ -570,6 +590,7 @@ func StartControllers(ctx context.Context, controllerCtx ControllerContext, star
 
 	var controllerChecks []healthz.HealthChecker
 
+	// 遍历所有controller，然后调用initFn
 	for controllerName, initFn := range controllers {
 		if !controllerCtx.IsControllerEnabled(controllerName) {
 			klog.Warningf("%q is disabled", controllerName)
